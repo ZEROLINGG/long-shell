@@ -1,7 +1,12 @@
 [package]
-name = "long_shell"
+name = "long-shell"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "A persistent, long-lived shell session manager with async real-time output streaming, callback hooks, and cross-platform encoding support."
+repository = "https://github.com/ZEROLINGG/long-shell"
+documentation = ""
+homepage = ""
 
 [dependencies]
 anyhow = "1"
