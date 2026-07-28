@@ -59,8 +59,6 @@ pub async fn powershell() -> Result<Arc<Mutex<Shell>>> {
 // ─── 平台相关 ─────────────────────────────────────────────────────────────────
 
 #[cfg(windows)]
-use std::os::windows::process::CommandExt;
-#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 // ─── 常量 ─────────────────────────────────────────────────────────────────────
@@ -909,6 +907,7 @@ fn init_command(shell_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use tokio::sync::mpsc;
     use tokio::time::{sleep, timeout, Duration};
 

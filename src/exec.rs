@@ -48,7 +48,6 @@ pub async fn exec<'a>(
 
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
@@ -124,6 +123,7 @@ fn to_exec_result(output: std::process::Output) -> ExecResult {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
 
     #[cfg(unix)]

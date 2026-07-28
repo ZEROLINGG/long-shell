@@ -31,7 +31,7 @@ pub fn detect_encoding() -> &'static Encoding {
 
 #[cfg(windows)]
 fn detect_encoding_windows() -> &'static Encoding {
-    extern "system" {
+    unsafe extern "system" {
         fn GetConsoleOutputCP() -> u32;
     }
     let cp = unsafe { GetConsoleOutputCP() };
