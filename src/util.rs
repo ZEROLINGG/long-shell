@@ -1,6 +1,7 @@
-use std::path::Path;
-use anyhow::{anyhow, Result};
+//src/util.rs
+use anyhow::{Result, anyhow};
 use encoding_rs::{CoderResult, Decoder, Encoding, UTF_8};
+use std::path::Path;
 
 pub fn normalize_shell_name(shell: &str) -> Result<String> {
     let mut name = Path::new(shell)
@@ -107,4 +108,9 @@ impl Default for StreamDecoder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+
+pub fn strip_ansi_codes(text: &str) -> String {
+    strip_ansi_escapes::strip_str(text)
 }

@@ -1,33 +1,33 @@
-
+//src/shell/mod.rs
 
 mod backend;
-pub(crate) mod callbacks;
 pub(crate) mod buffer;
 mod builder;
+pub(crate) mod callbacks;
 pub(crate) mod profile;
 pub(crate) mod stream;
 
-pub use builder::ShellBuilder;
 pub use buffer::OutputBuffer;
+pub use builder::ShellBuilder;
 pub use callbacks::CallbackMode;
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use anyhow::{anyhow, ensure, Result};
-use tokio::sync::{mpsc, oneshot, Mutex, Notify, OnceCell};
+use anyhow::{Result, anyhow, ensure};
+use tokio::sync::{Mutex, Notify, OnceCell, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-#[cfg(feature = "pty")]
-use rust_pty::PtySignal;
-use tokio::time::sleep;
 use crate::shell::backend::LaunchConfig;
 #[cfg(feature = "pty")]
 use crate::shell::backend::PtyState;
 use crate::shell::callbacks::{BoxFuture, CallbackHub, PreSendHook};
 use crate::shell::profile::ShellProfile;
 use crate::shell::stream::StdinMsg;
+#[cfg(feature = "pty")]
+use rust_pty::PtySignal;
+use tokio::time::sleep;
 
 // ─── 全局单例 ────────────────────────────────────────────────────────────────
 
@@ -77,11 +77,33 @@ pub enum Key {
 }
 
 pub enum SpecialKey {
-    Up, Down, Left, Right,
-    Home, End, PageUp, PageDown,
-    Insert, Delete, Tab, BackTab,
-    Enter, Escape, Backspace,
-    F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Insert,
+    Delete,
+    Tab,
+    BackTab,
+    Enter,
+    Escape,
+    Backspace,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
 }
 impl SpecialKey {
     /// 按常见 xterm 编码（不考虑 DECCKM application mode，覆盖绝大多数场景）
@@ -149,7 +171,6 @@ impl SpecialKey {
         }
     }
 }
-
 
 // ─── ShellOutput ───────────────────────────────────────────────────────────
 
@@ -286,14 +307,19 @@ impl Shell {
     }
 
     /// 等待直到 stdout 和 stderr 均空闲超过 `idle_time`（默认 200 ms），然后返回并清空缓冲。
-    pub async fn output(&mut self, idle_time: Option<Duration>, max_wait: Option<Duration>) -> ShellOutput {
+    pub async fn output(
+        &mut self,
+        idle_time: Option<Duration>,
+        max_wait: Option<Duration>,
+    ) -> ShellOutput {
         let timeout = idle_time.unwrap_or(Duration::from_millis(200));
 
         if self.output_buffer.is_none() && self.error_buffer.is_none() {
             return ShellOutput::default();
         }
 
-        self.wait_idle(timeout, Some(max_wait.unwrap_or(Duration::from_secs(60)))).await;
+        self.wait_idle(timeout, Some(max_wait.unwrap_or(Duration::from_secs(60))))
+            .await;
 
         let stdout = if let Some(ob) = &self.output_buffer {
             ob.take().await
@@ -399,7 +425,11 @@ impl Shell {
 
     /// 返回渲染后的虚拟终端屏幕快照（仅 PTY 模式，且未 `disable_snapshot()`）。
     #[cfg(feature = "pty")]
-    pub async fn output_snapshot(&mut self, idle_time: Option<Duration>, max_wait: Option<Duration>) -> Result<String> {
+    pub async fn output_snapshot(
+        &mut self,
+        idle_time: Option<Duration>,
+        max_wait: Option<Duration>,
+    ) -> Result<String> {
         ensure!(!self.droped, "shell is closed");
 
         let parser = self
@@ -410,7 +440,8 @@ impl Shell {
             .clone();
 
         if let Some(idle) = idle_time {
-            self.wait_idle(idle, Some(max_wait.unwrap_or(Duration::from_secs(60)))).await;
+            self.wait_idle(idle, Some(max_wait.unwrap_or(Duration::from_secs(60))))
+                .await;
         } else {
             sleep(max_wait.unwrap_or(Duration::from_secs(60))).await;
         }
@@ -597,13 +628,15 @@ impl Shell {
                 let ctrl_byte = upper as u8 ^ 0x40;
                 let data = String::from_utf8(vec![ctrl_byte]).unwrap_or_default();
 
-                return self.tx_stdin
+                return self
+                    .tx_stdin
                     .send(StdinMsg::Data(data))
                     .await
                     .map_err(|_| anyhow!("send control char failed: stdin channel closed"));
             } else if upper == '?' {
                 // 特例：终端标准中，`^?` 通常代表 DEL (0x7F / 127)
-                return self.tx_stdin
+                return self
+                    .tx_stdin
                     .send(StdinMsg::Data("\x7F".to_string()))
                     .await
                     .map_err(|_| anyhow!("send DEL failed: stdin channel closed"));
@@ -620,7 +653,6 @@ impl Shell {
             _ => Ok(()),                  // 按需求，忽略管道模式下无意义的其他控制字符
         }
     }
-
 
     // ── 生命周期 ──────────────────────────────────────────────────────────
 
@@ -742,7 +774,7 @@ fn parse_control_shortcut(cmd: &str) -> Option<char> {
 mod tests {
     use super::*;
     use tokio::sync::mpsc as test_mpsc;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     #[test]
     fn control_shortcut_parsing() {
@@ -761,7 +793,7 @@ mod tests {
             .expect("failed to spawn sh");
 
         shell.send_line("echo hello_tokio").await.unwrap();
-        let out = shell.output(Some(Duration::from_millis(300)),None).await;
+        let out = shell.output(Some(Duration::from_millis(300)), None).await;
         assert!(out.stdout.contains("hello_tokio"));
 
         shell.exit().await.unwrap();
@@ -811,11 +843,11 @@ mod tests {
             .unwrap();
 
         shell.send_line("echo BLOCK_ME").await.unwrap();
-        let blocked = shell.output(Some(Duration::from_millis(200)),None).await;
+        let blocked = shell.output(Some(Duration::from_millis(200)), None).await;
         assert!(!blocked.stdout.contains("BLOCK_ME"));
 
         shell.send_line("echo FOO_TEST").await.unwrap();
-        let modified = shell.output(Some(Duration::from_millis(200)),None).await;
+        let modified = shell.output(Some(Duration::from_millis(200)), None).await;
         assert!(modified.stdout.contains("BAR_TEST"));
 
         shell.exit().await.unwrap();
@@ -828,13 +860,13 @@ mod tests {
 
         shell.send_line("EXPORTED_VAR=12345").await.unwrap();
         shell.send_line("echo $EXPORTED_VAR").await.unwrap();
-        let out1 = shell.output(Some(Duration::from_millis(200)),None).await;
+        let out1 = shell.output(Some(Duration::from_millis(200)), None).await;
         assert!(out1.stdout.contains("12345"));
 
         shell.reset().await.expect("reset failed");
 
         shell.send_line("echo $EXPORTED_VAR").await.unwrap();
-        let out2 = shell.output(Some(Duration::from_millis(200)),None).await;
+        let out2 = shell.output(Some(Duration::from_millis(200)), None).await;
         assert!(!out2.stdout.contains("12345"));
 
         shell.exit().await.unwrap();
@@ -855,7 +887,7 @@ mod tests {
 
         shell.send_line("printf 'SNAP_MARK\\n'").await.unwrap();
         let snap = shell
-            .output_snapshot(Some(Duration::from_millis(300)),None)
+            .output_snapshot(Some(Duration::from_millis(300)), None)
             .await
             .expect("snapshot failed");
         assert!(snap.contains("SNAP_MARK"));
