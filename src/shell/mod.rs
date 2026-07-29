@@ -1,12 +1,4 @@
-//! `Shell`：对外的核心类型，本文件只负责"胶水"——字段组装与公开方法转发，
-//! 具体实现分散在各个子模块中：
-//!
-//! - `builder`  — 链式配置
-//! - `profile`  — 各 shell 的启动参数/初始化/退出命令
-//! - `callbacks`— 回调类型与封装
-//! - `buffer`   — 有界输出缓冲区
-//! - `stream`   — 管道模式读取 + Raw/Line 统一解码分派
-//! - `backend`  — PTY 状态收敛 + 统一的会话启动入口
+
 
 mod backend;
 pub(crate) mod callbacks;
@@ -29,7 +21,7 @@ use tokio::task::JoinHandle;
 
 #[cfg(feature = "pty")]
 use rust_pty::PtySignal;
-
+use tokio::time::sleep;
 use crate::shell::backend::LaunchConfig;
 #[cfg(feature = "pty")]
 use crate::shell::backend::PtyState;
@@ -77,6 +69,87 @@ pub async fn powershell() -> Result<Arc<Mutex<Shell>>> {
         Err(e) => Err(anyhow!("{e}")),
     }
 }
+
+pub enum Key {
+    SpecialKey(SpecialKey),
+    Char(char),
+    StringChar(String), // 处理时尝试解析[Up],[Down]……为SpecialKey
+}
+
+pub enum SpecialKey {
+    Up, Down, Left, Right,
+    Home, End, PageUp, PageDown,
+    Insert, Delete, Tab, BackTab,
+    Enter, Escape, Backspace,
+    F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+}
+impl SpecialKey {
+    /// 按常见 xterm 编码（不考虑 DECCKM application mode，覆盖绝大多数场景）
+    fn to_bytes(&self) -> &'static str {
+        match self {
+            SpecialKey::Up => "\x1b[A",
+            SpecialKey::Down => "\x1b[B",
+            SpecialKey::Right => "\x1b[C",
+            SpecialKey::Left => "\x1b[D",
+            SpecialKey::Home => "\x1b[H",
+            SpecialKey::End => "\x1b[F",
+            SpecialKey::PageUp => "\x1b[5~",
+            SpecialKey::PageDown => "\x1b[6~",
+            SpecialKey::Insert => "\x1b[2~",
+            SpecialKey::Delete => "\x1b[3~",
+            SpecialKey::Tab => "\t",
+            SpecialKey::BackTab => "\x1b[Z",
+            SpecialKey::Enter => "\r",
+            SpecialKey::Escape => "\x1b",
+            SpecialKey::Backspace => "\x7f",
+            SpecialKey::F1 => "\x1bOP",
+            SpecialKey::F2 => "\x1bOQ",
+            SpecialKey::F3 => "\x1bOR",
+            SpecialKey::F4 => "\x1bOS",
+            SpecialKey::F5 => "\x1b[15~",
+            SpecialKey::F6 => "\x1b[17~",
+            SpecialKey::F7 => "\x1b[18~",
+            SpecialKey::F8 => "\x1b[19~",
+            SpecialKey::F9 => "\x1b[20~",
+            SpecialKey::F10 => "\x1b[21~",
+            SpecialKey::F11 => "\x1b[23~",
+            SpecialKey::F12 => "\x1b[24~",
+        }
+    }
+    pub fn from_str_tag(tag: &str) -> Option<Self> {
+        match tag.to_lowercase().as_str() {
+            "[up]" => Some(SpecialKey::Up),
+            "[down]" => Some(SpecialKey::Down),
+            "[left]" => Some(SpecialKey::Left),
+            "[right]" => Some(SpecialKey::Right),
+            "[home]" => Some(SpecialKey::Home),
+            "[end]" => Some(SpecialKey::End),
+            "[pageup]" => Some(SpecialKey::PageUp),
+            "[pagedown]" => Some(SpecialKey::PageDown),
+            "[insert]" => Some(SpecialKey::Insert),
+            "[delete]" => Some(SpecialKey::Delete),
+            "[tab]" => Some(SpecialKey::Tab),
+            "[backtab]" => Some(SpecialKey::BackTab),
+            "[enter]" | "[return]" => Some(SpecialKey::Enter),
+            "[escape]" | "[esc]" => Some(SpecialKey::Escape),
+            "[backspace]" => Some(SpecialKey::Backspace),
+            "[f1]" => Some(SpecialKey::F1),
+            "[f2]" => Some(SpecialKey::F2),
+            "[f3]" => Some(SpecialKey::F3),
+            "[f4]" => Some(SpecialKey::F4),
+            "[f5]" => Some(SpecialKey::F5),
+            "[f6]" => Some(SpecialKey::F6),
+            "[f7]" => Some(SpecialKey::F7),
+            "[f8]" => Some(SpecialKey::F8),
+            "[f9]" => Some(SpecialKey::F9),
+            "[f10]" => Some(SpecialKey::F10),
+            "[f11]" => Some(SpecialKey::F11),
+            "[f12]" => Some(SpecialKey::F12),
+            _ => None,
+        }
+    }
+}
+
 
 // ─── ShellOutput ───────────────────────────────────────────────────────────
 
@@ -155,14 +228,17 @@ impl Shell {
 
     // ── 输出读取 ──────────────────────────────────────────────────────────
 
-    /// 等待直到 stdout/stderr 均空闲超过 `timeout`，但不清空缓冲区。
-    async fn wait_idle(&self, timeout: Duration) {
+    /// 等待直到 stdout/stderr 均空闲超过 `idle_time`，但不清空缓冲区。
+    /// `timeout` 提供了可选的最大整体等待时长，防止在终端持续输出时发生无限等待。
+    async fn wait_idle(&self, idle_time: Duration, timeout: Option<Duration>) {
         let ob_out = self.output_buffer.as_ref();
         let ob_err = self.error_buffer.as_ref();
 
         if ob_out.is_none() && ob_err.is_none() {
             return;
         }
+
+        let deadline = timeout.map(|d| tokio::time::Instant::now() + d);
 
         loop {
             let notify_out = async {
@@ -180,17 +256,29 @@ impl Shell {
                 }
             };
 
+            // 创建整体超时的 future，类似于 output_until 的实现
+            let sleep_fut: BoxFuture<'_, ()> = match deadline {
+                Some(inst) => {
+                    if tokio::time::Instant::now() >= inst {
+                        break;
+                    }
+                    Box::pin(tokio::time::sleep_until(inst))
+                }
+                None => Box::pin(std::future::pending()),
+            };
+
             tokio::select! {
                 _ = self.close_notify.notified() => break,
-                res = tokio::time::timeout(timeout, async {
+                _ = sleep_fut => break, // 触发整体超时，强制中断等待
+                res = tokio::time::timeout(idle_time, async {
                     tokio::select! {
                         _ = notify_out => {}
                         _ = notify_err => {}
                     }
                 }) => {
                     match res {
-                        Ok(_)  => continue,
-                        Err(_) => break,
+                        Ok(_)  => continue, // 收到了新数据，继续循环等待其空闲
+                        Err(_) => break,    // 满足空闲时长 idle_time，退出
                     }
                 }
             }
@@ -198,14 +286,14 @@ impl Shell {
     }
 
     /// 等待直到 stdout 和 stderr 均空闲超过 `idle_time`（默认 200 ms），然后返回并清空缓冲。
-    pub async fn output(&mut self, idle_time: Option<Duration>) -> ShellOutput {
+    pub async fn output(&mut self, idle_time: Option<Duration>, max_wait: Option<Duration>) -> ShellOutput {
         let timeout = idle_time.unwrap_or(Duration::from_millis(200));
 
         if self.output_buffer.is_none() && self.error_buffer.is_none() {
             return ShellOutput::default();
         }
 
-        self.wait_idle(timeout).await;
+        self.wait_idle(timeout, Some(max_wait.unwrap_or(Duration::from_secs(60)))).await;
 
         let stdout = if let Some(ob) = &self.output_buffer {
             ob.take().await
@@ -311,7 +399,7 @@ impl Shell {
 
     /// 返回渲染后的虚拟终端屏幕快照（仅 PTY 模式，且未 `disable_snapshot()`）。
     #[cfg(feature = "pty")]
-    pub async fn output_snapshot(&mut self, wait: Option<Duration>) -> Result<String> {
+    pub async fn output_snapshot(&mut self, idle_time: Option<Duration>, max_wait: Option<Duration>) -> Result<String> {
         ensure!(!self.droped, "shell is closed");
 
         let parser = self
@@ -321,8 +409,10 @@ impl Shell {
             .vt_parser()?
             .clone();
 
-        if let Some(idle) = wait {
-            self.wait_idle(idle).await;
+        if let Some(idle) = idle_time {
+            self.wait_idle(idle, Some(max_wait.unwrap_or(Duration::from_secs(60)))).await;
+        } else {
+            sleep(max_wait.unwrap_or(Duration::from_secs(60))).await;
         }
 
         let guard = parser
@@ -386,6 +476,38 @@ impl Shell {
             .map_err(|_| anyhow!("signal channel closed"))
     }
 
+    #[cfg(feature = "pty")]
+    pub fn cursor_position(&self) -> Result<(u16, u16)> {
+        ensure!(!self.droped, "shell is closed");
+
+        let parser = self
+            .pty
+            .as_ref()
+            .ok_or_else(|| anyhow!("cursor_position() requires enable_pty()"))?
+            .vt_parser()?;
+
+        let guard = parser
+            .lock()
+            .map_err(|_| anyhow!("vt100 parser lock poisoned"))?;
+
+        // vt100 库返回的光标位置通常是 (row, col)，从 0 开始
+        Ok(guard.screen().cursor_position())
+    }
+    #[cfg(feature = "pty")]
+    pub async fn move_cursor_to(&mut self, row: u16, col: u16) -> Result<()> {
+        ensure!(!self.droped, "shell is closed");
+
+        if self.is_pty() {
+            // \x1b[{row};{col}H 是标准的 CUP (Cursor Position) 控制序列
+            let seq = format!("\x1b[{};{}H", row, col);
+            self.tx_stdin
+                .send(StdinMsg::Data(seq))
+                .await
+                .map_err(|_| anyhow!("move_cursor_to failed"))
+        } else { Ok(()) }
+
+    }
+
     /// 返回 stdout 缓冲区因超出容量而丢弃的累计字节数。
     pub fn output_truncated_bytes(&self) -> usize {
         self.output_buffer
@@ -404,6 +526,37 @@ impl Shell {
     }
 
     // ── 发送 ──────────────────────────────────────────────────────────────
+    pub async fn send_keys(&mut self, keys: Vec<Key>) -> Result<()> {
+        ensure!(!self.droped, "shell is closed");
+
+        let mut buffer = String::new();
+
+        for key in keys {
+            match key {
+                Key::SpecialKey(sk) => {
+                    buffer.push_str(sk.to_bytes());
+                }
+                Key::Char(c) => {
+                    buffer.push(c);
+                }
+                Key::StringChar(s) => {
+                    if let Some(sk) = SpecialKey::from_str_tag(&s) {
+                        buffer.push_str(sk.to_bytes());
+                    } else {
+                        buffer.push_str(&s);
+                    }
+                }
+            }
+        }
+
+        if !buffer.is_empty() {
+            self.tx_stdin
+                .send(StdinMsg::Data(buffer))
+                .await
+                .map_err(|_| anyhow!("send_keys failed: stdin channel closed"))?;
+        }
+        Ok(())
+    }
 
     pub async fn send(&mut self, cmd: &str) -> Result<()> {
         ensure!(!self.droped, "shell is closed");
@@ -608,7 +761,7 @@ mod tests {
             .expect("failed to spawn sh");
 
         shell.send_line("echo hello_tokio").await.unwrap();
-        let out = shell.output(Some(Duration::from_millis(300))).await;
+        let out = shell.output(Some(Duration::from_millis(300)),None).await;
         assert!(out.stdout.contains("hello_tokio"));
 
         shell.exit().await.unwrap();
@@ -658,11 +811,11 @@ mod tests {
             .unwrap();
 
         shell.send_line("echo BLOCK_ME").await.unwrap();
-        let blocked = shell.output(Some(Duration::from_millis(200))).await;
+        let blocked = shell.output(Some(Duration::from_millis(200)),None).await;
         assert!(!blocked.stdout.contains("BLOCK_ME"));
 
         shell.send_line("echo FOO_TEST").await.unwrap();
-        let modified = shell.output(Some(Duration::from_millis(200))).await;
+        let modified = shell.output(Some(Duration::from_millis(200)),None).await;
         assert!(modified.stdout.contains("BAR_TEST"));
 
         shell.exit().await.unwrap();
@@ -675,13 +828,13 @@ mod tests {
 
         shell.send_line("EXPORTED_VAR=12345").await.unwrap();
         shell.send_line("echo $EXPORTED_VAR").await.unwrap();
-        let out1 = shell.output(Some(Duration::from_millis(200))).await;
+        let out1 = shell.output(Some(Duration::from_millis(200)),None).await;
         assert!(out1.stdout.contains("12345"));
 
         shell.reset().await.expect("reset failed");
 
         shell.send_line("echo $EXPORTED_VAR").await.unwrap();
-        let out2 = shell.output(Some(Duration::from_millis(200))).await;
+        let out2 = shell.output(Some(Duration::from_millis(200)),None).await;
         assert!(!out2.stdout.contains("12345"));
 
         shell.exit().await.unwrap();
@@ -702,7 +855,7 @@ mod tests {
 
         shell.send_line("printf 'SNAP_MARK\\n'").await.unwrap();
         let snap = shell
-            .output_snapshot(Some(Duration::from_millis(300)))
+            .output_snapshot(Some(Duration::from_millis(300)),None)
             .await
             .expect("snapshot failed");
         assert!(snap.contains("SNAP_MARK"));
