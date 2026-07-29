@@ -433,20 +433,41 @@ impl Shell {
     }
 
     pub async fn send_control_char(&mut self, ctrl: char) -> Result<()> {
-        match ctrl {
-            'R' => self.reset().await, // 特别占用 ^R 为 shell 重置语义
-            'D' => self.send_eof().await,
-            'C' => self.send_interrupt().await,
-            _ => Ok(()),
+        let upper = ctrl.to_ascii_uppercase();
+
+        #[cfg(feature = "pty")]
+        if self.is_pty() {
+            // PTY 模式下：使用公式计算完整的控制字符并直接发送给终端
+            // 标准 ASCII 控制字符对应的可打印字符范围是 '@' (0x40) 到 '_' (0x5F)
+            if upper >= '@' && upper <= '_' {
+                // 公式：字符的 ASCII 码与 0x40 异或，映射到 0x00 - 0x1F
+                let ctrl_byte = upper as u8 ^ 0x40;
+                let data = String::from_utf8(vec![ctrl_byte]).unwrap_or_default();
+
+                return self.tx_stdin
+                    .send(StdinMsg::Data(data))
+                    .await
+                    .map_err(|_| anyhow!("send control char failed: stdin channel closed"));
+            } else if upper == '?' {
+                // 特例：终端标准中，`^?` 通常代表 DEL (0x7F / 127)
+                return self.tx_stdin
+                    .send(StdinMsg::Data("\x7F".to_string()))
+                    .await
+                    .map_err(|_| anyhow!("send DEL failed: stdin channel closed"));
+            }
+
+            // 如果不是有效范围内的字符，忽略
+            return Ok(());
+        }
+
+        // 管道模式（非 PTY 模式）下：只保留特殊的硬编码控制语义
+        match upper {
+            'R' => self.reset().await,    // 自定义语义：彻底重置 Shell 会话
+            'D' => self.send_eof().await, // EOF：向底层管道发送结束信号 (关闭 stdin)
+            _ => Ok(()),                  // 按需求，忽略管道模式下无意义的其他控制字符
         }
     }
 
-    async fn send_interrupt(&mut self) -> Result<()> {
-        self.tx_stdin
-            .send(StdinMsg::Data("\x03".to_string()))
-            .await
-            .map_err(|_| anyhow!("send interrupt failed: stdin channel closed"))
-    }
 
     // ── 生命周期 ──────────────────────────────────────────────────────────
 
@@ -541,18 +562,22 @@ impl Drop for Shell {
     }
 }
 
-/// 识别 `^C` / `^D` / `^R` 这类控制字符简写，返回大写的控制字符。
-/// 独立成纯函数，便于单测且不依赖 `Shell` 实例。
+/// 识别 `^C` / `^A` / `^?` 这类控制字符简写，返回大写的控制字符。
 fn parse_control_shortcut(cmd: &str) -> Option<char> {
     if cmd.len() >= 5 {
-        return None; // 快速失败，避免不必要的 trim/遍历
+        return None;
     }
     let trimmed = cmd.trim();
     let mut chars = trimmed.chars();
     match (chars.next(), chars.next(), chars.next()) {
         (Some('^'), Some(c), None) => {
             let upper = c.to_ascii_uppercase();
-            "CDR".contains(upper).then_some(upper)
+            // 允许 '@' 到 '_' (包含了 A-Z) 以及 '?'
+            if (upper >= '@' && upper <= '_') || upper == '?' {
+                Some(upper)
+            } else {
+                None
+            }
         }
         _ => None,
     }

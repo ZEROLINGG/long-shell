@@ -5,26 +5,30 @@ A persistent, long-lived shell session manager for async Rust. Spawn a shell onc
 ```rust
 use shell_engine::shell::Shell;
 
-let mut sh = Shell::new("bash")
-    .enable_buffer()
-    .line_callback()
-    .spawn()
-    .await?;
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let mut sh = Shell::new("bash")
+        .enable_buffer()
+        .spawn()
+        .await?;
 
-sh.send_line("export FOO=bar").await?;
-sh.send_line("echo $FOO").await?;
-let out = sh.output(None).await;
-assert_eq!(out.stdout.trim(), "bar");
+    sh.send_line("export FOO=bar").await?;
+    sh.send_line("echo $FOO").await?;
+    let out = sh.output(None).await;
+    assert_eq!(out.stdout.trim(), "bar");
+    sh.exit().await?;
+    Ok(())
+}
 ```
 
 ## Features
 
 - **Persistent process** — One spawn, many commands; env, cwd, and shell state survive between calls
-- **Two output modes** — Raw (lowest latency, per-chunk) or Line (buffered per-line with idle flush)
+- **Two output modes** — Raw (lowest latency, per-chunk) or Line (buffered per-line with 80 ms idle flush for interactive prompts)
 - **Bounded buffering** — Configurable-capacity `OutputBuffer` with overflow truncation tracking
 - **Async callbacks** — Hooks for stdout, stderr, exit, close, and pre-send filtering
-- **Lifecycle control** — `send`, `reset`, `exit` (graceful), `close` (immediate), `join`, and auto-close on drop
-- **PTY support** — Optional pseudo-terminal backend for full terminal apps, job control, and colored output
+- **Lifecycle control** — `send`, `reset`, `exit` (graceful), `close` (immediate), `join_close`, `join_exit`, and auto-close on drop
+- **PTY support** — Optional pseudo-terminal backend for full terminal apps, job control, colored output, and signal forwarding
 - **Screen snapshot** — PTY mode captures rendered terminal content via `vt100` parser (`output_snapshot`)
 - **Cross-platform** — Unix (bash, zsh, sh, fish, python, node) and Windows (cmd, powershell, pwsh, python, node)
 - **Encoding support** — Stateful incremental decoder; auto-detects Windows code page
@@ -47,14 +51,14 @@ assert_eq!(out.stdout.trim(), "bar");
 
 ```toml
 [dependencies]
-shell-engine = "0.1"
+shell-engine = "0.1.1"
 ```
 
 PTY support (via `rust-pty` + `vt100`) is enabled by default. To disable it:
 
 ```toml
 [dependencies]
-shell-engine = { version = "0.1", default-features = false }
+shell-engine = { version = "0.1.1", default-features = false }
 ```
 
 ## Usage
@@ -62,13 +66,13 @@ shell-engine = { version = "0.1", default-features = false }
 ### Persistent Shell
 
 ```rust
-use shell_engine::shell::{Shell, CallbackMode};
+use shell_engine::shell::Shell;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut shell = Shell::new("bash")
         .enable_buffer()              // Buffer stdout/stderr (default 4 MiB)
-        .line_callback()              // Callbacks receive complete lines
+        .line_callback()              // Complete lines; partial flushed after 80 ms idle
         .on_output(|line| async move {
             println!("[stdout] {line}");
         })
@@ -196,23 +200,35 @@ let lost = buf.truncated_bytes.load(std::sync::atomic::Ordering::Relaxed);
 |------|-------------|
 | `Shell` | Live handle to a persistent shell process |
 | `ShellBuilder` | Fluent builder for configuring and spawning a `Shell` |
-| `ShellOutput` | Result struct containing `stdout` and `stderr` fields |
+| `ShellOutput` | Result struct containing `stdout` and `stderr` fields; provides `is_empty()` |
 | `OutputBuffer` | Bounded, async-concurrent output accumulator |
 | `CallbackMode` | `Raw` (per-chunk) or `Line` (per-line) callback mode |
 
-**`Shell` lifecycle methods:** `send`, `send_line`, `send_control_char`, `send_eof`, `reset`, `exit`, `close`, `join`, `join_exit`
+**`Shell` lifecycle methods:** `send`, `send_line`, `send_control_char`, `send_eof`, `reset`, `exit`, `close`, `join_close`, `join_exit`
 
-**`Shell` output methods:** `output`, `output_until`, `output_truncated_bytes`, `error_truncated_bytes`
+**`Shell` output methods:** `output`, `output_until`
 
-**`Shell` PTY methods (requires `pty` feature):** `output_snapshot`, `screen_clone`, `resize`, `is_pty`, `pty_window_size`
+**`Shell` stats:** `output_truncated_bytes`, `error_truncated_bytes`
+
+**`Shell` PTY methods (requires `pty` feature):** `output_snapshot`, `screen_clone`, `resize`, `is_pty`, `pty_window_size`, `send_signal`
 
 **`ShellBuilder` config:** `enable_buffer`, `enable_buffer_with_capacity`, `line_callback`, `raw_callback`
 
-**`ShellBuilder` PTY config (requires `pty` feature):** `enable_pty`, `pty_size`, `scrollback`, `disable_snapshot`
+**`ShellBuilder` PTY config (requires `pty` feature):** `enable_pty`, `pty_size`, `scrollback`, `disable_snapshot` (saves CPU/memory; `output_snapshot`/`screen_clone` will error)
 
 **`ShellBuilder` hooks:** `on_output`, `on_error`, `on_exit`, `on_close`, `on_send`
 
 **`OutputBuffer` methods:** `new`, `push`, `take`, `is_empty`
+
+**`OutputBuffer` public fields:** `notify` (waker for new data), `truncated_bytes` (overflow counter)
+
+### Crate root re-exports (requires `pty` feature)
+
+`vt100` and `rust_pty` are re-exported at the crate root. Use `shell_engine::vt100::Screen` or `shell_engine::rust_pty::WindowSize` without adding them to your own `Cargo.toml`.
+
+### `util` module
+
+Low-level helpers: `StreamDecoder` (incremental text decoder), `decode_bytes`, `detect_encoding`.
 
 ### `exec` module
 
