@@ -6,6 +6,7 @@ pub mod util;
 
 #[cfg(feature = "pty")]
 mod pty;
+mod pipe;
 
 pub use shell::{CallbackMode, OutputBuffer, Shell, ShellBuilder, ShellOutput};
 
