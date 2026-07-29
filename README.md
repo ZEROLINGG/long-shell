@@ -27,7 +27,8 @@ async fn main() -> anyhow::Result<()> {
 - **Two output modes** — Raw (lowest latency, per-chunk) or Line (buffered per-line with 80 ms idle flush for interactive prompts)
 - **Bounded buffering** — Configurable-capacity `OutputBuffer` with overflow truncation tracking
 - **Async callbacks** — Hooks for stdout, stderr, exit, close, and pre-send filtering
-- **Lifecycle control** — `send`, `reset`, `exit` (graceful), `close` (immediate), `join_close`, `join_exit`, and auto-close on drop
+- **Lifecycle control** — `send`, `send_line`, `send_control_char`, `reset`, `exit`, `close`, `join_close`, `join_exit`, and auto-close on drop
+- **Control characters** — `send("^C")` auto-detects `^X` syntax; PTY mode supports full `^A`–`^_` and `^?`, pipe mode supports `^R` (reset) and `^D` (EOF)
 - **PTY support** — Optional pseudo-terminal backend for full terminal apps, job control, colored output, and signal forwarding
 - **Screen snapshot** — PTY mode captures rendered terminal content via `vt100` parser (`output_snapshot`)
 - **Cross-platform** — Unix (bash, zsh, sh, fish, python, node) and Windows (cmd, powershell, pwsh, python, node)
@@ -148,6 +149,9 @@ async fn main() -> anyhow::Result<()> {
     let snap = shell.output_snapshot(Some(std::time::Duration::from_millis(500))).await?;
     println!("Screen: {snap}");
 
+    // Send control characters (fully supported in PTY mode)
+    shell.send_control_char('C').await?;  // ^C interrupt
+
     // Adjust terminal window size
     shell.resize(120, 40).await?;
 
@@ -204,7 +208,7 @@ let lost = buf.truncated_bytes.load(std::sync::atomic::Ordering::Relaxed);
 | `OutputBuffer` | Bounded, async-concurrent output accumulator |
 | `CallbackMode` | `Raw` (per-chunk) or `Line` (per-line) callback mode |
 
-**`Shell` lifecycle methods:** `send`, `send_line`, `send_control_char`, `send_eof`, `reset`, `exit`, `close`, `join_close`, `join_exit`
+**`Shell` lifecycle methods:** `send` (auto-detects `"^C"` syntax; routes to `send_control_char`), `send_line`, `send_control_char` (PTY: full `^A`–`^_` + `^?`; pipe: `^R` reset, `^D` EOF), `send_eof`, `reset`, `exit`, `close`, `join_close`, `join_exit`
 
 **`Shell` output methods:** `output`, `output_until`
 
