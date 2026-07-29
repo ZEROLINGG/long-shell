@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shell-Engine Terminal</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm/css/xterm.css">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        html, body {
+            height: 100vh;
+            background: #0f111a;
+            font-family: system-ui, -apple-system, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            overflow: hidden;
+        }
+
+        /* 终端外层拟真窗口容器 */
+        .terminal-container {
+            width: 95vw;
+            height: 90vh;
+            max-width: 1400px;
+            max-height: 900px;
+            background: #181a23;
+            border-radius: 12px;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.08);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* 窗口顶部标题栏 */
+        .terminal-header {
+            height: 40px;
+            background: #1e202d;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 16px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            user-select: none;
+        }
+
+        /* 苹果风格窗口控制按钮 */
+        .window-controls {
+            display: flex;
+            gap: 8px;
+        }
+        .control-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+        .dot-close { background: #ff5f56; }
+        .dot-minimize { background: #ffbd2e; }
+        .dot-maximize { background: #27c93f; }
+
+        /* 标题文字 */
+        .terminal-title {
+            color: #8b949e;
+            font-size: 13px;
+            font-weight: 500;
+            letter-spacing: 0.5px;
+        }
+
+        /* 连接状态指示器 */
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            color: #8b949e;
+            font-size: 12px;
+        }
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #f85149;
+            transition: background 0.3s ease;
+        }
+        .status-dot.connected {
+            background: #3fb950;
+            box-shadow: 0 0 8px rgba(63, 185, 80, 0.4);
+        }
+
+        /* xterm 挂载区域 */
+        #terminal {
+            flex: 1;
+            padding: 12px;
+            overflow: hidden;
+        }
+    </style>
+</head>
+<body>
+
+<div class="terminal-container">
+    <div class="terminal-header">
+        <div class="window-controls">
+            <div class="control-dot dot-close"></div>
+            <div class="control-dot dot-minimize"></div>
+            <div class="control-dot dot-maximize"></div>
+        </div>
+        <div class="terminal-title">shell-engine</div>
+        <div class="status-indicator">
+            <div id="statusDot" class="status-dot"></div>
+            <span id="statusText">Connecting</span>
+        </div>
+    </div>
+    <div id="terminal"></div>
+</div>
+
+<script type="importmap">
+    {
+        "imports": {
+            "@xterm/xterm": "https://cdn.jsdelivr.net/npm/@xterm/xterm/+esm",
+            "@xterm/addon-fit": "https://cdn.jsdelivr.net/npm/@xterm/addon-fit/+esm"
+        }
+    }
+</script>
+<script type="module">
+    import { Terminal } from '@xterm/xterm';
+    import { FitAddon } from '@xterm/addon-fit';
+
+    const statusDot = document.getElementById('statusDot');
+    const statusText = document.getElementById('statusText');
+
+    const term = new Terminal({
+        cursorBlink: true,
+        fontSize: 14,
+        fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+        theme: {
+            background: '#181a23',
+            foreground: '#c9d1d9',
+            cursor: '#58a6ff',
+            selectionBackground: 'rgba(88, 166, 255, 0.3)',
+            black: '#484f58',
+            red: '#ff7b72',
+            green: '#3fb950',
+            yellow: '#d29922',
+            blue: '#58a6ff',
+            magenta: '#bc8cff',
+            cyan: '#39c5cf',
+            white: '#b1bac4',
+        },
+    });
+
+    const fit = new FitAddon();
+    term.loadAddon(fit);
+    term.open(document.getElementById('terminal'));
+
+    const ws = new WebSocket(`ws://${location.host}/ws`);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => {
+        statusDot.classList.add('connected');
+        statusText.textContent = 'Connected';
+        fit.fit();
+        term.focus();
+    };
+
+    ws.onmessage = (e) => term.write(e.data);
+
+    ws.onclose = () => {
+        statusDot.classList.remove('connected');
+        statusText.textContent = 'Disconnected';
+        term.dispose();
+    };
+
+    ws.onerror = () => {
+        statusText.textContent = 'Error';
+        term.write('\r\n\x1b[31mWebSocket connection error\x1b[0m\r\n');
+    };
+
+    term.onData((data) => ws.send(data));
+
+    const onResize = () => {
+        fit.fit();
+        ws.send(JSON.stringify({ resize: [term.cols, term.rows] }));
+    };
+
+    // 使用防抖优化窗口大小调整
+    let resizeTimeout;
+    window.addEventListener('resize', () => {
+        clearTimeout(resizeTimeout);
+        resizeTimeout = setTimeout(onResize, 100);
+    });
+</script>
+</body>
+</html>
