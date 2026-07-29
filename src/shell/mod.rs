@@ -442,6 +442,7 @@ impl Shell {
     #[cfg(feature = "pty")]
     pub async fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
         ensure!(!self.droped, "shell is closed");
+        ensure!(cols > 0 && rows > 0, "cols and rows must be >= 1");
         let state = self
             .pty
             .as_mut()
@@ -496,16 +497,15 @@ impl Shell {
     #[cfg(feature = "pty")]
     pub async fn move_cursor_to(&mut self, row: u16, col: u16) -> Result<()> {
         ensure!(!self.droped, "shell is closed");
+        ensure!(self.pty.is_some(), "move_cursor_to() requires enable_pty()");
+        ensure!(row >= 1 && col >= 1, "row/col are 1-based and must be >= 1");
 
-        if self.is_pty() {
-            // \x1b[{row};{col}H 是标准的 CUP (Cursor Position) 控制序列
-            let seq = format!("\x1b[{};{}H", row, col);
-            self.tx_stdin
-                .send(StdinMsg::Data(seq))
-                .await
-                .map_err(|_| anyhow!("move_cursor_to failed"))
-        } else { Ok(()) }
-
+        // \x1b[{row};{col}H 是标准的 CUP (Cursor Position) 控制序列
+        let seq = format!("\x1b[{};{}H", row, col);
+        self.tx_stdin
+            .send(StdinMsg::Data(seq))
+            .await
+            .map_err(|_| anyhow!("move_cursor_to failed"))
     }
 
     /// 返回 stdout 缓冲区因超出容量而丢弃的累计字节数。
