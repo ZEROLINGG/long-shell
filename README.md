@@ -14,7 +14,7 @@ let mut sh = Shell::new("bash")
 sh.send_line("export FOO=bar").await?;
 sh.send_line("echo $FOO").await?;
 let out = sh.output(None).await;
-assert_eq!(out.trim(), "bar");
+assert_eq!(out.stdout.trim(), "bar");
 ```
 
 ## Features
@@ -24,6 +24,8 @@ assert_eq!(out.trim(), "bar");
 - **Bounded buffering** — Configurable-capacity `OutputBuffer` with overflow truncation tracking
 - **Async callbacks** — Hooks for stdout, stderr, exit, close, and pre-send filtering
 - **Lifecycle control** — `send`, `reset`, `exit` (graceful), `close` (immediate), `join`, and auto-close on drop
+- **PTY support** — Optional pseudo-terminal backend for full terminal apps, job control, and colored output
+- **Screen snapshot** — PTY mode captures rendered terminal content via `vt100` parser (`output_snapshot`)
 - **Cross-platform** — Unix (bash, zsh, sh, fish, python, node) and Windows (cmd, powershell, pwsh, python, node)
 - **Encoding support** — Stateful incremental decoder; auto-detects Windows code page
 - **One-shot execution** — `exec()` for fire-and-forget commands with optional timeout
@@ -46,6 +48,13 @@ assert_eq!(out.trim(), "bar");
 ```toml
 [dependencies]
 long-shell = "0.1"
+```
+
+PTY support (via `rust-pty` + `vt100`) is enabled by default. To disable it:
+
+```toml
+[dependencies]
+long-shell = { version = "0.1", default-features = false }
 ```
 
 ## Usage
@@ -84,11 +93,11 @@ async fn main() -> anyhow::Result<()> {
 
     shell.send_line("ls -la").await?;
     let output = shell.output(None).await;
-    println!("Output: {output}");
+    println!("stdout: {}", output.stdout);
 
     shell.send_line("echo done").await?;
     let output = shell.output(Some(std::time::Duration::from_millis(500))).await;
-    println!("Output: {output}");
+    println!("stdout: {}", output.stdout);
 
     // Reset: kill the process and spawn a fresh one (buffers + callbacks preserved)
     shell.reset().await?;
@@ -112,6 +121,35 @@ assert!(result.success());
 
 // Unwrap stdout on success, or get stderr on failure
 let output: anyhow::Result<String> = result.ok();
+```
+
+### PTY Mode
+
+For full terminal applications (editors, `htop`, `screen`, etc.), enable the pseudo-terminal backend:
+
+```rust
+use long_shell::shell::Shell;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let mut shell = Shell::new("bash")
+        .enable_pty()                     // Use PTY instead of pipes
+        .enable_buffer()
+        .spawn()
+        .await?;
+
+    shell.send_line("vim").await?;
+
+    // Wait for output and capture a rendered screen snapshot
+    let snap = shell.output_snapshot(Some(std::time::Duration::from_millis(500))).await?;
+    println!("Screen: {snap}");
+
+    // Adjust terminal window size
+    shell.resize(120, 40).await?;
+
+    shell.exit().await?;
+    Ok(())
+}
 ```
 
 ### Global Singletons
@@ -158,12 +196,19 @@ let lost = buf.truncated_bytes.load(std::sync::atomic::Ordering::Relaxed);
 |------|-------------|
 | `Shell` | Live handle to a persistent shell process |
 | `ShellBuilder` | Fluent builder for configuring and spawning a `Shell` |
+| `ShellOutput` | Result struct containing `stdout` and `stderr` fields |
 | `OutputBuffer` | Bounded, async-concurrent output accumulator |
 | `CallbackMode` | `Raw` (per-chunk) or `Line` (per-line) callback mode |
 
 **`Shell` lifecycle methods:** `send`, `send_line`, `send_control_char`, `send_eof`, `reset`, `exit`, `close`, `join`, `join_exit`
 
-**`Shell` output methods:** `output`, `output_error`, `output_truncated_bytes`, `error_truncated_bytes`
+**`Shell` output methods:** `output`, `output_until`, `output_truncated_bytes`, `error_truncated_bytes`
+
+**`Shell` PTY methods (requires `pty` feature):** `output_snapshot`, `screen_clone`, `resize`, `is_pty`, `pty_window_size`
+
+**`ShellBuilder` config:** `enable_buffer`, `enable_buffer_with_capacity`, `line_callback`, `raw_callback`
+
+**`ShellBuilder` PTY config (requires `pty` feature):** `enable_pty`, `pty_size`, `scrollback`, `disable_snapshot`
 
 **`ShellBuilder` hooks:** `on_output`, `on_error`, `on_exit`, `on_close`, `on_send`
 
