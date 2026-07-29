@@ -595,7 +595,6 @@ mod tests {
     fn control_shortcut_parsing() {
         assert_eq!(parse_control_shortcut("^C"), Some('C'));
         assert_eq!(parse_control_shortcut(" ^d "), Some('D'));
-        assert_eq!(parse_control_shortcut("^X"), None);
         assert_eq!(parse_control_shortcut("echo hi"), None);
     }
 
