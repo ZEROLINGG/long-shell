@@ -1,6 +1,6 @@
 [package]
 name = "shell-engine"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "MIT"
 description = "An async shell runtime for persistent sessions, PTY I/O, output buffering, real-time callbacks, and screen snapshots."
