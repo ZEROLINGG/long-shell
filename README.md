@@ -52,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
 
 ```toml
 [dependencies]
-shell-engine = "0.1.1"
+shell-engine = "0.2.0"
 ```
 
 PTY support (via `rust-pty` + `vt100`) is enabled by default. To disable it:
