@@ -15,5 +15,17 @@ serde = { version = "1", features = ["derive"] }
 
 encoding_rs = "0.8"
 
+rust-pty = { version = "0.5.0", optional = true}
+vt100 = { version = "0.16.2", optional = true}
+
 [target.'cfg(windows)'.dependencies]
 codepage = "0.1"
+
+[features]
+default = [
+    "pty"
+]
+pty = [
+    "dep:rust-pty",
+    "dep:vt100"
+]

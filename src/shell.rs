@@ -13,6 +13,11 @@ use tokio::sync::{mpsc, oneshot, Mutex, Notify, OnceCell};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
+#[cfg(feature = "pty")]
+use std::sync::Mutex as StdMutex;
+#[cfg(feature = "pty")]
+use rust_pty::PtySignal;
+
 use crate::util::{normalize_shell_name, StreamDecoder};
 
 // ─── 全局单例 ────────────────────────────────────────────────────────────────
@@ -64,11 +69,11 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 // ─── 常量 ─────────────────────────────────────────────────────────────────────
 
 /// 每次 `read()` 的块大小。
-const READ_CHUNK_SIZE: usize = 8192;
+pub(crate) const READ_CHUNK_SIZE: usize = 8192;
 
 /// 行模式：输出空闲多久后，即便没有换行符也强制 flush 已缓存内容。
 /// 决定了交互式 prompt（如 `>>> `）这类不带换行输出的最大展示延迟。
-const LINE_MODE_FLUSH_IDLE: Duration = Duration::from_millis(80);
+pub(crate) const LINE_MODE_FLUSH_IDLE: Duration = Duration::from_millis(80);
 
 /// 行模式：单行数据超过该长度时强制切块 flush，防止超长行导致内存无限增长。
 const LINE_MODE_FORCE_FLUSH: usize = 64 * 1024;
@@ -76,9 +81,17 @@ const LINE_MODE_FORCE_FLUSH: usize = 64 * 1024;
 /// `OutputBuffer` 默认容量上限（字节）。超过后丢弃最旧的数据。
 const DEFAULT_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
 
+/// PTY 模式默认窗口尺寸（列, 行）。
+#[cfg(feature = "pty")]
+const DEFAULT_PTY_SIZE: (u16, u16) = (80, 24);
+
+/// PTY 模式默认 vt100 回滚缓冲行数。
+#[cfg(feature = "pty")]
+const DEFAULT_SCROLLBACK: usize = 2000;
+
 // ─── 类型别名 ─────────────────────────────────────────────────────────────────
 
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 type AsyncPreSendCallback =
 Box<dyn FnMut(String) -> BoxFuture<'static, Option<String>> + Send + 'static>;
@@ -109,22 +122,51 @@ impl Default for CallbackMode {
 
 // ─── 内部消息 ─────────────────────────────────────────────────────────────────
 
-enum StdinMsg {
+pub(crate) enum StdinMsg {
     Data(String),
     Close,
-    Eof
+    Eof,
+    /// 调整 PTY 窗口尺寸（列, 行）。管道模式下会被忽略。
+    #[cfg(feature = "pty")]
+    Resize(u16, u16),
 }
 
 // ─── 回调集合 ─────────────────────────────────────────────────────────────────
 
 #[derive(Default)]
-struct Callbacks {
+pub(crate) struct Callbacks {
     on_output: Option<AsyncOutputCallback>,
     on_error:  Option<AsyncErrorCallback>,
     on_exit:   Option<AsyncExitCallback>,
     on_close:  Option<AsyncCloseCallback>,
-    /// 回调触发粒度，由 `ShellBuilder` 设置，spawn 后不可变。
     mode:      CallbackMode,
+}
+
+/// 读取当前回调模式（供 pty 后端在 spawn 时取一次快照）。
+pub(crate) async fn callback_mode(callbacks: &Arc<Mutex<Callbacks>>) -> CallbackMode {
+    callbacks.lock().await.mode
+}
+
+/// 触发 `on_exit` 回调（若已注册）。
+pub(crate) async fn fire_on_exit(callbacks: &Arc<Mutex<Callbacks>>, code: Option<i32>) {
+    let fut_opt = {
+        let mut cb = callbacks.lock().await;
+        cb.on_exit.as_mut().map(|f| f(code))
+    };
+    if let Some(fut) = fut_opt {
+        fut.await;
+    }
+}
+
+/// 触发 `on_close` 回调（若已注册）。
+pub(crate) async fn fire_on_close(callbacks: &Arc<Mutex<Callbacks>>) {
+    let fut_opt = {
+        let mut cb = callbacks.lock().await;
+        cb.on_close.as_mut().map(|f| f())
+    };
+    if let Some(fut) = fut_opt {
+        fut.await;
+    }
 }
 
 // ─── 输出缓冲区 ───────────────────────────────────────────────────────────────
@@ -194,6 +236,17 @@ impl OutputBuffer {
     }
 }
 
+// ─── PTY 后端标记（仅 pty feature） ────────────────────────────────────────────
+
+#[cfg(feature = "pty")]
+enum Backend {
+    Pipe,
+    Pty {
+        vt_parser: Option<Arc<StdMutex<vt100::Parser>>>,
+        _signal_tx: mpsc::Sender<PtySignal>,
+    },
+}
+
 // ─── Builder ──────────────────────────────────────────────────────────────────
 
 pub struct ShellBuilder {
@@ -202,6 +255,12 @@ pub struct ShellBuilder {
     callbacks:       Callbacks,
     close_notify:    Arc<Notify>,
     buffer_capacity: Option<usize>,
+
+    #[cfg(feature = "pty")] use_pty:      bool,
+    #[cfg(feature = "pty")] pty_cols:     u16,
+    #[cfg(feature = "pty")] pty_rows:     u16,
+    #[cfg(feature = "pty")] scrollback:   usize,
+    #[cfg(feature = "pty")] track_screen: bool,
 }
 
 impl ShellBuilder {
@@ -212,7 +271,52 @@ impl ShellBuilder {
             callbacks:       Callbacks::default(),   // mode = Raw
             close_notify:    Arc::new(Notify::new()),
             buffer_capacity: None,
+
+            #[cfg(feature = "pty")] use_pty:      false,
+            #[cfg(feature = "pty")] pty_cols:     DEFAULT_PTY_SIZE.0,
+            #[cfg(feature = "pty")] pty_rows:     DEFAULT_PTY_SIZE.1,
+            #[cfg(feature = "pty")] scrollback:   DEFAULT_SCROLLBACK,
+            #[cfg(feature = "pty")] track_screen: true,
         }
+    }
+
+    // ── PTY 配置 ──────────────────────────────────────────────────────────────
+
+    /// 启用后使用 PTY（伪终端）模式而不是管道模式。
+    ///
+    /// PTY 模式下：
+    /// - stdout / stderr 会被**合并**为一路输出（`on_error` / `stderr` 永远为空）；
+    /// - 子进程会看到自己连接在一个真实终端上（支持全屏程序、prompt 着色、
+    ///   job control）；
+    /// - 终端默认开启回显（echo），发送的命令本身也会出现在输出里；
+    /// - 支持 `resize()`、`output_snapshot()`（渲染后的屏幕快照）。
+    #[cfg(feature = "pty")]
+    pub fn enable_pty(mut self) -> Self {
+        self.use_pty = true;
+        self
+    }
+
+    /// 设置 PTY 初始窗口尺寸（默认 80x24）。仅在 `enable_pty()` 后生效。
+    #[cfg(feature = "pty")]
+    pub fn pty_size(mut self, cols: u16, rows: u16) -> Self {
+        self.pty_cols = cols;
+        self.pty_rows = rows;
+        self
+    }
+
+    /// 设置 vt100 屏幕快照的回滚缓冲行数（默认 2000）。
+    #[cfg(feature = "pty")]
+    pub fn scrollback(mut self, lines: usize) -> Self {
+        self.scrollback = lines;
+        self
+    }
+
+    /// 关闭 vt100 屏幕追踪，节省 CPU/内存。关闭后 `output_snapshot()` /
+    /// `screen_clone()` 将返回错误。
+    #[cfg(feature = "pty")]
+    pub fn disable_snapshot(mut self) -> Self {
+        self.track_screen = false;
+        self
     }
 
     // ── 缓冲区 ────────────────────────────────────────────────────────────────
@@ -267,6 +371,7 @@ impl ShellBuilder {
         self
     }
 
+    /// 注册 stderr 回调。**注意**：PTY 模式下 stdout/stderr 合并，此回调不会被触发。
     pub fn on_error<F, Fut>(mut self, mut f: F) -> Self
     where
         F:   FnMut(String) -> Fut + Send + 'static,
@@ -302,9 +407,49 @@ impl ShellBuilder {
 
         let pre_send  = Arc::new(Mutex::new(self.pre_send));
         let callbacks = Arc::new(Mutex::new(self.callbacks));
-
         let output_buffer =
             self.buffer_capacity.map(|cap| Arc::new(OutputBuffer::new(cap)));
+
+        #[cfg(feature = "pty")]
+        {
+            if self.use_pty {
+                let shell_name = normalize_shell_name(&shell_path)?;
+                let result = crate::pty::spawn_pty_process(
+                    &shell_path,
+                    &shell_name,
+                    self.pty_cols,
+                    self.pty_rows,
+                    self.scrollback,
+                    self.track_screen,
+                    callbacks.clone(),
+                    output_buffer.clone(),
+                )
+                    .await?;
+
+                return Ok(Shell {
+                    shell_path,
+                    tx_stdin: result.tx_stdin,
+                    drop_tx: Some(result.drop_tx),
+                    pre_send,
+                    callbacks,
+                    join: Some(result.join),
+                    droped: false,
+                    close_notify: self.close_notify,
+                    output_buffer,
+                    // PTY 合并 stdout/stderr，不单独使用 error_buffer
+                    error_buffer: None,
+                    backend: Backend::Pty {
+                        vt_parser: result.vt_parser,
+                        _signal_tx: result.signal_tx,
+                    },
+                    pty_cols: self.pty_cols,
+                    pty_rows: self.pty_rows,
+                    scrollback: self.scrollback,
+                    track_screen: self.track_screen,
+                });
+            }
+        }
+
         let error_buffer =
             self.buffer_capacity.map(|cap| Arc::new(OutputBuffer::new(cap)));
 
@@ -327,11 +472,30 @@ impl ShellBuilder {
             close_notify: self.close_notify,
             output_buffer,
             error_buffer,
+            #[cfg(feature = "pty")] backend: Backend::Pipe,
+            #[cfg(feature = "pty")] pty_cols: self.pty_cols,
+            #[cfg(feature = "pty")] pty_rows: self.pty_rows,
+            #[cfg(feature = "pty")] scrollback: self.scrollback,
+            #[cfg(feature = "pty")] track_screen: self.track_screen,
         })
     }
 }
 
 // ─── Shell ────────────────────────────────────────────────────────────────────
+
+/// 包含标准输出和标准错误的结果结构体
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShellOutput {
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl ShellOutput {
+    /// 检查输出和错误是否同时为空
+    pub fn is_empty(&self) -> bool {
+        self.stdout.is_empty() && self.stderr.is_empty()
+    }
+}
 
 pub struct Shell {
     pub shell_path:    String,
@@ -344,6 +508,12 @@ pub struct Shell {
     close_notify:  Arc<Notify>,
     output_buffer: Option<Arc<OutputBuffer>>,
     error_buffer:  Option<Arc<OutputBuffer>>,
+
+    #[cfg(feature = "pty")] backend:       Backend,
+    #[cfg(feature = "pty")] pty_cols:      u16,
+    #[cfg(feature = "pty")] pty_rows:      u16,
+    #[cfg(feature = "pty")] scrollback:    usize,
+    #[cfg(feature = "pty")] track_screen:  bool,
 }
 
 impl Shell {
@@ -351,42 +521,48 @@ impl Shell {
         ShellBuilder::new(shell)
     }
 
-    // ── 输出读取 ──────────────────────────────────────────────────────────────
-
-    /// 等待直到输出空闲超过 `idle_time`（默认 200 ms），然后返回并清空缓冲。
-    pub async fn output(&mut self, idle_time: Option<Duration>) -> String {
-        if self.output_buffer.is_none() {
-            return String::new();
-        }
-        let timeout = idle_time.unwrap_or(Duration::from_millis(200));
-        let ob = self.output_buffer.as_ref().unwrap();
-
-        loop {
-            tokio::select! {
-                _ = self.close_notify.notified() => break,
-                res = tokio::time::timeout(timeout, ob.notify.notified()) => {
-                    match res {
-                        Ok(_)  => continue,
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-        ob.take().await
+    /// 当前会话是否运行在 PTY 模式下。
+    #[cfg(feature = "pty")]
+    pub fn is_pty(&self) -> bool {
+        matches!(self.backend, Backend::Pty { .. })
     }
 
-    /// 同 `output`，针对 stderr。
-    pub async fn output_error(&mut self, idle_time: Option<Duration>) -> String {
-        if self.error_buffer.is_none() {
-            return String::new();
+    // ── 输出读取 ──────────────────────────────────────────────────────────────
+
+    /// 等待直到 stdout/stderr 均空闲超过 `idle_time`，但不清空缓冲区。
+    /// 供 `output()` / `output_snapshot()` 共用。
+    async fn wait_idle(&self, timeout: Duration) {
+        let ob_out = self.output_buffer.as_ref();
+        let ob_err = self.error_buffer.as_ref();
+
+        if ob_out.is_none() && ob_err.is_none() {
+            return;
         }
-        let timeout = idle_time.unwrap_or(Duration::from_millis(200));
-        let ob = self.error_buffer.as_ref().unwrap();
 
         loop {
+            let notify_out = async {
+                if let Some(ob) = ob_out {
+                    ob.notify.notified().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            let notify_err = async {
+                if let Some(ob) = ob_err {
+                    ob.notify.notified().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+
             tokio::select! {
                 _ = self.close_notify.notified() => break,
-                res = tokio::time::timeout(timeout, ob.notify.notified()) => {
+                res = tokio::time::timeout(timeout, async {
+                    tokio::select! {
+                        _ = notify_out => {}
+                        _ = notify_err => {}
+                    }
+                }) => {
                     match res {
                         Ok(_)  => continue,
                         Err(_) => break,
@@ -394,7 +570,180 @@ impl Shell {
                 }
             }
         }
-        ob.take().await
+    }
+
+    /// 等待直到 stdout 和 stderr 均空闲超过 `idle_time`（默认 200 ms），然后返回并清空缓冲。
+    pub async fn output(&mut self, idle_time: Option<Duration>) -> ShellOutput {
+        let timeout = idle_time.unwrap_or(Duration::from_millis(200));
+
+        if self.output_buffer.is_none() && self.error_buffer.is_none() {
+            return ShellOutput::default();
+        }
+
+        self.wait_idle(timeout).await;
+
+        let stdout = if let Some(ob) = &self.output_buffer {
+            ob.take().await
+        } else {
+            String::new()
+        };
+        let stderr = if let Some(ob) = &self.error_buffer {
+            ob.take().await
+        } else {
+            String::new()
+        };
+
+        ShellOutput { stdout, stderr }
+    }
+
+    /// 持续等待，直到 stdout 或 stderr 中出现指定的子串 `pattern`，
+    /// 或等待超过 `timeout`（为 `None` 时不设上限，只能靠 pattern 命中
+    /// 或 shell 被关闭结束），然后返回期间累积到的全部输出并清空缓冲区。
+    pub async fn output_until(&mut self, pattern: String, timeout: Option<Duration>) -> ShellOutput {
+        let ob_out = self.output_buffer.as_ref();
+        let ob_err = self.error_buffer.as_ref();
+
+        if ob_out.is_none() && ob_err.is_none() {
+            return ShellOutput::default();
+        }
+
+        let mut stdout_acc = String::new();
+        let mut stderr_acc = String::new();
+
+        let deadline = timeout.map(|d| tokio::time::Instant::now() + d);
+
+        loop {
+            if let Some(ob) = ob_out {
+                let chunk = ob.take().await;
+                if !chunk.is_empty() {
+                    stdout_acc.push_str(&chunk);
+                }
+            }
+            if let Some(ob) = ob_err {
+                let chunk = ob.take().await;
+                if !chunk.is_empty() {
+                    stderr_acc.push_str(&chunk);
+                }
+            }
+
+            if stdout_acc.contains(&pattern) || stderr_acc.contains(&pattern) {
+                break;
+            }
+
+            let sleep_fut: BoxFuture<'_, ()> = match deadline {
+                Some(inst) => {
+                    if tokio::time::Instant::now() >= inst {
+                        break;
+                    }
+                    Box::pin(tokio::time::sleep_until(inst))
+                }
+                None => Box::pin(std::future::pending()),
+            };
+
+            let notify_out = async {
+                if let Some(ob) = ob_out {
+                    ob.notify.notified().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            let notify_err = async {
+                if let Some(ob) = ob_err {
+                    ob.notify.notified().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+
+            tokio::select! {
+            _ = self.close_notify.notified() => break,
+            _ = sleep_fut => break,
+            _ = notify_out => {}
+            _ = notify_err => {}
+        }
+        }
+
+        if let Some(ob) = ob_out {
+            let chunk = ob.take().await;
+            if !chunk.is_empty() {
+                stdout_acc.push_str(&chunk);
+            }
+        }
+        if let Some(ob) = ob_err {
+            let chunk = ob.take().await;
+            if !chunk.is_empty() {
+                stderr_acc.push_str(&chunk);
+            }
+        }
+
+        ShellOutput {
+            stdout: stdout_acc,
+            stderr: stderr_acc,
+        }
+    }
+
+    /// 返回渲染后的虚拟终端屏幕快照（仅 PTY 模式，且未 `disable_snapshot()`）。
+    #[cfg(feature = "pty")]
+    pub async fn output_snapshot(&mut self, wait: Option<Duration>) -> Result<String> {
+        ensure!(!self.droped, "shell is closed");
+
+        let parser = match &self.backend {
+            Backend::Pty { vt_parser: Some(p), .. } => p.clone(),
+            Backend::Pty { vt_parser: None, .. } => {
+                anyhow::bail!("screen tracking is disabled; remove disable_snapshot() to use output_snapshot()")
+            }
+            Backend::Pipe => anyhow::bail!("output_snapshot() requires enable_pty()"),
+        };
+
+        if let Some(idle) = wait {
+            self.wait_idle(idle).await;
+
+        }
+
+        let guard = parser
+            .lock()
+            .map_err(|_| anyhow!("vt100 parser lock poisoned"))?;
+        Ok(guard.screen().contents())
+    }
+
+    /// 克隆一份 `vt100::Screen`，用于自定义渲染（拿光标位置、每格颜色等）。
+    #[cfg(feature = "pty")]
+    pub fn screen_clone(&self) -> Result<vt100::Screen> {
+        ensure!(!self.droped, "shell is closed");
+        match &self.backend {
+            Backend::Pty { vt_parser: Some(p), .. } => {
+                let guard = p
+                    .lock()
+                    .map_err(|_| anyhow!("vt100 parser lock poisoned"))?;
+                Ok(guard.screen().clone())
+            }
+            Backend::Pty { vt_parser: None, .. } => {
+                anyhow::bail!("screen tracking is disabled; remove disable_snapshot() to use screen_clone()")
+            }
+            Backend::Pipe => anyhow::bail!("screen_clone() requires enable_pty()"),
+        }
+    }
+
+    /// 调整 PTY 窗口尺寸（仅 PTY 模式）。
+    #[cfg(feature = "pty")]
+    pub async fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        ensure!(!self.droped, "shell is closed");
+        ensure!(
+            matches!(self.backend, Backend::Pty { .. }),
+            "resize() requires enable_pty()"
+        );
+        self.pty_cols = cols;
+        self.pty_rows = rows;
+        self.tx_stdin
+            .send(StdinMsg::Resize(cols, rows))
+            .await
+            .map_err(|_| anyhow!("resize failed: stdin channel closed"))
+    }
+
+    /// 当前记录的 PTY 窗口尺寸（列, 行）。
+    #[cfg(feature = "pty")]
+    pub fn pty_window_size(&self) -> (u16, u16) {
+        (self.pty_cols, self.pty_rows)
     }
 
     /// 返回 stdout 缓冲区因超出容量而丢弃的累计字节数。
@@ -406,6 +755,7 @@ impl Shell {
     }
 
     /// 返回 stderr 缓冲区因超出容量而丢弃的累计字节数。
+    /// PTY 模式下 stdout/stderr 合并，恒为 0。
     pub fn error_truncated_bytes(&self) -> usize {
         self.error_buffer
             .as_ref()
@@ -444,6 +794,7 @@ impl Shell {
     pub async fn send_line(&mut self, cmd: &str) -> Result<()> {
         self.send(&format!("{cmd}\n")).await
     }
+
     async fn send_eof(&mut self) -> Result<()> {
         self.tx_stdin
             .send(StdinMsg::Eof)
@@ -453,10 +804,18 @@ impl Shell {
 
     pub async fn send_control_char(&mut self, ctrl: char) -> Result<()> {
         match ctrl {
-            'R' => self.reset().await, // 特别占用^R为shell重置语义
+            'R' => self.reset().await, // 特别占用 ^R 为 shell 重置语义
             'D' => self.send_eof().await,
+            'C' => self.send_interrupt().await,
             _ => Ok(()),
         }
+    }
+
+    async fn send_interrupt(&mut self) -> Result<()> {
+        self.tx_stdin
+            .send(StdinMsg::Data("\x03".to_string()))
+            .await
+            .map_err(|_| anyhow!("send interrupt failed: stdin channel closed"))
     }
 
     // ── 生命周期 ──────────────────────────────────────────────────────────────
@@ -485,6 +844,33 @@ impl Shell {
         self.exit().await?;
         if let Some(handle) = self.join.take() {
             let _ = handle.await;
+        }
+
+        #[cfg(feature = "pty")]
+        {
+            if matches!(self.backend, Backend::Pty { .. }) {
+                let shell_name = normalize_shell_name(&self.shell_path)?;
+                let result = crate::pty::spawn_pty_process(
+                    &self.shell_path,
+                    &shell_name,
+                    self.pty_cols,
+                    self.pty_rows,
+                    self.scrollback,
+                    self.track_screen,
+                    self.callbacks.clone(),
+                    self.output_buffer.clone(),
+                )
+                    .await?;
+                self.tx_stdin = result.tx_stdin;
+                self.drop_tx  = Some(result.drop_tx);
+                self.join     = Some(result.join);
+                self.backend  = Backend::Pty {
+                    vt_parser: result.vt_parser,
+                    _signal_tx: result.signal_tx,
+                };
+                self.droped = false;
+                return Ok(());
+            }
         }
 
         let (tx_stdin, drop_tx, join) = Self::spawn_process(
@@ -623,6 +1009,9 @@ impl Shell {
                             stdin_opt = Some(stdin);
                         }
                     }
+                    // 管道模式不支持终端尺寸调整，直接忽略
+                    #[cfg(feature = "pty")]
+                    StdinMsg::Resize(_, _) => {}
                 }
             }
             drop(stdin_opt);
@@ -633,11 +1022,7 @@ impl Shell {
             let _code: Option<i32> = tokio::select! {
                 status = child.wait() => {
                     let code = status.ok().and_then(|s| s.code());
-                    let fut_opt = {
-                        let mut cb = cb_main.lock().await;
-                        cb.on_exit.as_mut().map(|f| f(code))
-                    };
-                    if let Some(fut) = fut_opt { fut.await; }
+                    fire_on_exit(&cb_main, code).await;
                     code
                 }
                 _ = drop_rx => {
@@ -650,11 +1035,7 @@ impl Shell {
 
             let _ = tokio::join!(stdout_task, stderr_task, stdin_task);
 
-            let fut_opt = {
-                let mut cb = cb_main.lock().await;
-                cb.on_close.as_mut().map(|f| f())
-            };
-            if let Some(fut) = fut_opt { fut.await; }
+            fire_on_close(&cb_main).await;
         });
 
         Ok((tx_stdin, drop_tx, join))
@@ -792,7 +1173,7 @@ async fn read_stream_line<R>(
 }
 
 /// 从 `carry` 中持续提取完整行并推送，直到没有 `\n` 或触发强制切块。
-async fn drain_lines(
+pub(crate) async fn drain_lines(
     carry:     &mut String,
     ob:        &Option<Arc<OutputBuffer>>,
     callbacks: &Arc<Mutex<Callbacks>>,
@@ -828,7 +1209,7 @@ async fn drain_lines(
 
 /// Raw 模式和 Line 模式强制 flush 时使用的统一推送原语：
 /// chunk 原样存入 buffer 并触发回调（不做任何裁剪）。
-async fn emit(
+pub(crate) async fn emit(
     chunk:     String,
     ob:        &Option<Arc<OutputBuffer>>,
     callbacks: &Arc<Mutex<Callbacks>>,
@@ -864,31 +1245,45 @@ async fn invoke_callback(
 
 // ─── 进程构建辅助 ─────────────────────────────────────────────────────────────
 
+/// 各 shell 的启动参数。`pty_mode` 用于区分：
+/// - 管道模式下 bash/zsh/sh 使用 `-s`（从 stdin 读脚本，非交互，干净无 prompt）；
+/// - PTY 模式下改用 `-i`（强制交互），以获得 job control、彩色 prompt 等
+///   完整终端体验——这正是使用 PTY 的意义所在。
+pub(crate) fn shell_args(shell_name: &str, pty_mode: bool) -> Result<Vec<&'static str>> {
+    Ok(match shell_name {
+        "bash" => if pty_mode {
+            vec!["--norc", "--noprofile", "-i"]
+        } else {
+            vec!["--norc", "--noprofile", "-s"]
+        },
+        "zsh" => if pty_mode {
+            vec!["-f", "-i"]
+        } else {
+            vec!["-f", "-s"]
+        },
+        "sh" => if pty_mode { vec!["-i"] } else { vec!["-s"] },
+        "fish"                 => vec!["--no-config", "-i"],
+        "cmd"                  => vec!["/Q", "/K", "prompt $G"],
+        "powershell" | "pwsh"  => vec![
+            "-ExecutionPolicy", "Bypass",
+            "-NoExit",
+            "-NoProfile",
+        ],
+        "python"               => vec!["-u", "-i"],
+        "node"                 => vec!["-i"],
+        _ => anyhow::bail!("unsupported shell: {shell_name}"),
+    })
+}
+
 fn build_command(shell: &str, shell_name: &str) -> Result<Command> {
     let mut cmd = Command::new(shell);
     // #[cfg(unix)]
     // cmd.process_group(0);
-    match shell_name {
-        "bash"                    => { cmd.args(["--norc", "--noprofile", "-s"]); }
-        "zsh"                     => { cmd.args(["-f", "-s"]); }
-        "sh"                      => { cmd.args(["-s"]); }
-        "fish"                    => { cmd.args(["--no-config", "-i"]); }
-        "cmd"                     => { cmd.args(["/Q", "/K", "prompt $G"]); }
-        "powershell" | "pwsh"     => {
-            cmd.args([
-                "-ExecutionPolicy", "Bypass",
-                "-NoExit",
-                "-NoProfile",
-            ]);
-        }
-        "python"                  => { cmd.args(["-u", "-i"]); }
-        "node"                    => { cmd.arg("-i"); }
-        _                         => anyhow::bail!("unsupported shell: {shell_name}"),
-    }
+    cmd.args(shell_args(shell_name, false)?);
     Ok(cmd)
 }
 
-fn init_command(shell_name: &str) -> Option<String> {
+pub(crate) fn init_command(shell_name: &str) -> Option<String> {
     match shell_name {
         "cmd" => Some("chcp 65001 >nul 2>&1\r\n".into()),
         "powershell" | "pwsh" => Some(
@@ -928,15 +1323,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_output_buffer_capacity_truncation() {
-        // 容量上限设置为 10 字节
         let buffer = OutputBuffer::new(10);
 
-        // 推入 6 字节 ("hello ")
         buffer.push(Arc::from("hello ")).await;
         assert_eq!(buffer.truncated_bytes.load(Ordering::Relaxed), 0);
 
-        // 推入 6 字节 ("world!")，总共 12 字节 > 10 字节上限
-        // 最旧的 chunk ("hello ") 会被抛弃
         buffer.push(Arc::from("world!")).await;
 
         assert_eq!(buffer.truncated_bytes.load(Ordering::Relaxed), 6);
@@ -979,7 +1370,7 @@ mod tests {
         shell.send_line("echo 'hello_tokio'").await.unwrap();
 
         let out = shell.output(Some(Duration::from_millis(300))).await;
-        assert!(out.contains("hello_tokio"));
+        assert!(out.stdout.contains("hello_tokio"));
 
 
         shell.exit().await.unwrap();
@@ -997,7 +1388,7 @@ mod tests {
         shell.send_line("echo hello_tokio").await.unwrap();
 
         let out = shell.output(Some(Duration::from_millis(300))).await;
-        assert!(out.contains("hello_tokio"));
+        assert!(out.stdout.contains("hello_tokio"));
 
         shell.exit().await.unwrap();
     }
@@ -1057,7 +1448,6 @@ mod tests {
             .await
             .unwrap();
 
-        // 写入 stderr
         shell.send_line("echo 'error_msg' >&2").await.unwrap();
 
         let err_out = timeout(Duration::from_secs(2), rx.recv())
@@ -1079,7 +1469,7 @@ mod tests {
             .enable_buffer()
             .on_send(|cmd| async move {
                 if cmd.contains("BLOCK") {
-                    None // 拦截并丢弃该命令
+                    None
                 } else {
                     Some(cmd.replace("FOO", "BAR"))
                 }
@@ -1088,15 +1478,13 @@ mod tests {
             .await
             .unwrap();
 
-        // 该命令包含 BLOCK，应被拦截
         shell.send_line("echo BLOCK_ME").await.unwrap();
         let out_blocked = shell.output(Some(Duration::from_millis(200))).await;
-        assert!(!out_blocked.contains("BLOCK_ME"));
+        assert!(!out_blocked.stdout.contains("BLOCK_ME"));
 
-        // 该命令 FOO 被替换为 BAR
         shell.send_line("echo FOO_TEST").await.unwrap();
         let out_modified = shell.output(Some(Duration::from_millis(200))).await;
-        assert!(out_modified.contains("BAR_TEST"));
+        assert!(out_modified.stdout.contains("BAR_TEST"));
 
         shell.exit().await.unwrap();
     }
@@ -1112,20 +1500,17 @@ mod tests {
             .await
             .unwrap();
 
-        // 设置环境变量
         shell.send_line("EXPORTED_VAR=12345").await.unwrap();
         shell.send_line("echo $EXPORTED_VAR").await.unwrap();
 
         let out1 = shell.output(Some(Duration::from_millis(200))).await;
-        assert!(out1.contains("12345"));
+        assert!(out1.stdout.contains("12345"));
 
-        // 执行 Reset，底层进程将被杀掉并重新 spawn
         shell.reset().await.expect("Reset failed");
 
-        // 验证旧环境状态已清理
         shell.send_line("echo $EXPORTED_VAR").await.unwrap();
         let out2 = shell.output(Some(Duration::from_millis(200))).await;
-        assert!(!out2.contains("12345"));
+        assert!(!out2.stdout.contains("12345"));
 
         shell.exit().await.unwrap();
     }
@@ -1155,5 +1540,114 @@ mod tests {
         assert!(closed_triggered, "on_close callback was not invoked");
     }
 
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_output_until() {
+        let mut shell = Shell::new("sh")
+            .enable_buffer()
+            .spawn()
+            .await
+            .unwrap();
+
+        shell.send_line("sleep 0.2; echo READY_MARK; echo more").await.unwrap();
+
+        let out = shell
+            .output_until("READY_MARK".to_string(), Some(Duration::from_secs(2)))
+            .await;
+
+        assert!(out.stdout.contains("READY_MARK"));
+
+        shell.exit().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_output_until_timeout() {
+        let mut shell = Shell::new("sh")
+            .enable_buffer()
+            .spawn()
+            .await
+            .unwrap();
+
+        shell.send_line("echo hello").await.unwrap();
+
+        let out = shell
+            .output_until("NEVER_APPEARS".to_string(), Some(Duration::from_millis(300)))
+            .await;
+
+        assert!(out.stdout.contains("hello"));
+
+        shell.exit().await.unwrap();
+    }
+
+    // ── 6. PTY 模式测试 ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    #[cfg(all(unix, feature = "pty"))]
+    async fn test_pty_basic_output() {
+        let mut shell = Shell::new("sh")
+            .enable_pty()
+            .enable_buffer()
+            .spawn()
+            .await
+            .expect("failed to spawn pty shell");
+
+        shell.send_line("echo pty_hello").await.unwrap();
+        let out = shell.output(Some(Duration::from_millis(300))).await;
+        assert!(out.stdout.contains("pty_hello"));
+
+        shell.exit().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(all(unix, feature = "pty"))]
+    async fn test_pty_snapshot() {
+        let mut shell = Shell::new("sh")
+            .enable_pty()
+            .enable_buffer()
+            .spawn()
+            .await
+            .expect("failed to spawn pty shell");
+
+        shell.send_line("printf 'SNAP_MARK\\n'").await.unwrap();
+        let snap = shell
+            .output_snapshot(Some(Duration::from_millis(300)))
+            .await
+            .expect("snapshot failed");
+        assert!(snap.contains("SNAP_MARK"));
+
+        shell.exit().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(all(unix, feature = "pty"))]
+    async fn test_pty_interrupt() {
+        let mut shell = Shell::new("zsh")
+            .enable_pty()
+            .enable_buffer()
+            .raw_callback()
+            .on_output(async move |s| { print!("{}", s) })
+            .on_close(async move || { println!("[close]") })
+            .on_exit(async move |i| { println!("[exit: {:?}]",i) })
+            .spawn()
+            .await
+            .expect("failed to spawn pty shell");
+
+        shell.send_line("sleep 300 && echo ok").await.unwrap();
+        sleep(Duration::from_millis(150)).await;
+        shell.send_control_char('C').await.unwrap();
+        shell.send_line("uname").await.unwrap();
+        sleep(Duration::from_millis(150)).await;
+
+
+        shell.send_line("fastfetch").await.unwrap();
+        shell.wait_idle(Duration::from_millis(500)).await;
+
+        let out = shell.output(Some(Duration::from_millis(5000))).await;
+        println!("!!!!!!!!!!!!!!!!\n{:?}\n!!!!!!!!!!!!!!!!\n",out.stdout);
+
+
+        shell.exit().await.unwrap();
+    }
 
 }
