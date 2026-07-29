@@ -1,11 +1,11 @@
 [package]
-name = "long-shell"
+name = "shell-engine"
 version = "0.1.1"
 edition = "2024"
 license = "MIT"
-description = "A persistent, long-lived shell session manager with async real-time output streaming, callback hooks, and cross-platform encoding support."
-repository = "https://github.com/ZEROLINGG/long-shell"
-documentation = "https://docs.rs/long-shell"
+description = "An async shell runtime for persistent sessions, PTY I/O, output buffering, real-time callbacks, and screen snapshots."
+repository = "https://github.com/ZEROLINGG/shell-engine"
+documentation = "https://docs.rs/shell-engine"
 homepage = "https://github.com/ZEROLINGG"
 
 [dependencies]
@@ -17,6 +17,7 @@ encoding_rs = "0.8"
 
 rust-pty = { version = "0.5.0", optional = true}
 vt100 = { version = "0.16.2", optional = true}
+
 
 [target.'cfg(windows)'.dependencies]
 codepage = "0.1"

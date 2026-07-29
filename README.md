@@ -1,9 +1,9 @@
-# long-shell
+# shell-engine
 
 A persistent, long-lived shell session manager for async Rust. Spawn a shell once, then interact with it across multiple commands — state, environment variables, and working directory persist.
 
 ```rust
-use long_shell::shell::Shell;
+use shell_engine::shell::Shell;
 
 let mut sh = Shell::new("bash")
     .enable_buffer()
@@ -47,14 +47,14 @@ assert_eq!(out.stdout.trim(), "bar");
 
 ```toml
 [dependencies]
-long-shell = "0.1"
+shell-engine = "0.1"
 ```
 
 PTY support (via `rust-pty` + `vt100`) is enabled by default. To disable it:
 
 ```toml
 [dependencies]
-long-shell = { version = "0.1", default-features = false }
+shell-engine = { version = "0.1", default-features = false }
 ```
 
 ## Usage
@@ -62,7 +62,7 @@ long-shell = { version = "0.1", default-features = false }
 ### Persistent Shell
 
 ```rust
-use long_shell::shell::{Shell, CallbackMode};
+use shell_engine::shell::{Shell, CallbackMode};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
 For commands where persistent state isn't needed:
 
 ```rust
-use long_shell::exec::{exec, ExecResult};
+use shell_engine::exec::{exec, ExecResult};
 use std::time::Duration;
 
 let result: ExecResult = exec("echo hello", "bash", Some(Duration::from_secs(5))).await?;
@@ -128,7 +128,7 @@ let output: anyhow::Result<String> = result.ok();
 For full terminal applications (editors, `htop`, `screen`, etc.), enable the pseudo-terminal backend:
 
 ```rust
-use long_shell::shell::Shell;
+use shell_engine::shell::Shell;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -158,7 +158,7 @@ async fn main() -> anyhow::Result<()> {
 // Unix: shared global bash instance
 #[cfg(unix)]
 {
-    let bash = long_shell::shell::bash().await?;
+    let bash = shell_engine::shell::bash().await?;
     let mut sh = bash.lock().await;
     sh.send_line("echo hello").await?;
 }
@@ -166,7 +166,7 @@ async fn main() -> anyhow::Result<()> {
 // Windows: shared global powershell instance
 #[cfg(windows)]
 {
-    let ps = long_shell::shell::powershell().await?;
+    let ps = shell_engine::shell::powershell().await?;
     let mut sh = ps.lock().await;
     sh.send_line("Write-Output hello").await?;
 }
@@ -175,7 +175,7 @@ async fn main() -> anyhow::Result<()> {
 ### Output Buffer
 
 ```rust
-use long_shell::shell::OutputBuffer;
+use shell_engine::shell::OutputBuffer;
 
 let buf = OutputBuffer::new(1024 * 1024); // 1 MiB
 buf.push("line 1\n".into()).await;

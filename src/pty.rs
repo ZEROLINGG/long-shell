@@ -1,72 +1,60 @@
-//! PTY（伪终端）后端。
-//!
-//! 与管道模式（`Shell::spawn_process`）不同，PTY 模式下只有一个双向、
-//! 合并了 stdout/stderr 的流（`PtyMaster: AsyncRead + AsyncWrite`）。
-//! 因此这里不像管道模式那样拆成 3 个独立 I/O 任务，而是用**一个 I/O 任务**
-//! 在同一个 `master` 上通过 `select!` 轮流处理"读输出"和"写输入/resize"，
-//! 这样才能持续持有 `master` 以便随时调用 `resize()`（一旦
-//! `tokio::io::split()` 就会丢失这个方法）。
-//!
-//! 进程生命周期（等待退出 / 外部 kill / 信号转发）由独立的监督任务负责，
-//! 与 I/O 任务通过 `mpsc`/`oneshot` 通道解耦。
-
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::Result;
 use rust_pty::{NativePtySystem, PtyChild, PtyConfig, PtyMaster, PtySignal, PtySystem, WindowSize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::shell::{
+    CallbackMode, Callbacks, LINE_MODE_FLUSH_IDLE, OutputBuffer, READ_CHUNK_SIZE, StdinMsg,
     callback_mode, drain_lines, emit, fire_on_close, fire_on_exit, init_command, shell_args,
-    Callbacks, CallbackMode, OutputBuffer, StdinMsg, LINE_MODE_FLUSH_IDLE, READ_CHUNK_SIZE,
 };
 use crate::util::StreamDecoder;
 
 /// `spawn_pty_process` 的返回值集合。
 pub(crate) struct PtySpawnResult {
-    pub tx_stdin:   mpsc::Sender<StdinMsg>,
-    pub drop_tx:    oneshot::Sender<()>,
-    pub join:       JoinHandle<()>,
-    pub vt_parser:  Option<Arc<StdMutex<vt100::Parser>>>,
-    pub signal_tx:  mpsc::Sender<PtySignal>,
+    pub tx_stdin: mpsc::Sender<StdinMsg>,
+    pub drop_tx: oneshot::Sender<()>,
+    pub join: JoinHandle<()>,
+    pub vt_parser: Option<Arc<StdMutex<vt100::Parser>>>,
+    pub signal_tx: mpsc::Sender<PtySignal>,
 }
 
 /// 启动一个 PTY 会话，返回给 `Shell` 用于驱动交互的各种句柄。
 pub(crate) async fn spawn_pty_process(
-    shell_path:    &str,
-    shell_name:    &str,
-    cols:          u16,
-    rows:          u16,
-    scrollback:    usize,
-    track_screen:  bool,
-    callbacks:     Arc<Mutex<Callbacks>>,
+    shell_path: &str,
+    shell_name: &str,
+    cols: u16,
+    rows: u16,
+    scrollback: usize,
+    track_screen: bool,
+    callbacks: Arc<Mutex<Callbacks>>,
     output_buffer: Option<Arc<OutputBuffer>>,
 ) -> Result<PtySpawnResult> {
     let args = shell_args(shell_name, true)?;
 
     let config = PtyConfig::builder().window_size(cols, rows).build();
 
-    // NativePtySystem::spawn 返回 rust_pty::Result<(Master, Child)>；
-    // PtyError 实现 std::error::Error，`?` 会自动转换为 anyhow::Error。
+
     let (mut master, child) = NativePtySystem::spawn(shell_path, args, &config).await?;
 
-    // 部分 shell（cmd/powershell）需要显式切到 UTF-8 编码，逻辑与管道模式一致。
     if let Some(init) = init_command(shell_name) {
         master.write_all(init.as_bytes()).await?;
         master.flush().await?;
     }
 
     let vt_parser: Option<Arc<StdMutex<vt100::Parser>>> = if track_screen {
-        Some(Arc::new(StdMutex::new(vt100::Parser::new(rows, cols, scrollback))))
+        Some(Arc::new(StdMutex::new(vt100::Parser::new(
+            rows, cols, scrollback,
+        ))))
     } else {
         None
     };
 
     let (tx_stdin, rx_stdin) = mpsc::channel::<StdinMsg>(32);
-    let (drop_tx, drop_rx)   = oneshot::channel::<()>();
+    let (drop_tx, drop_rx) = oneshot::channel::<()>();
     let (signal_tx, signal_rx) = mpsc::channel::<PtySignal>(8);
 
     let mode = callback_mode(&callbacks).await;
@@ -92,19 +80,19 @@ pub(crate) async fn spawn_pty_process(
 /// 单一 I/O 任务：持续持有 `master`，交替处理"读输出"、"写输入/resize"、
 /// "行模式空闲 flush"。
 async fn run_pty_io<M>(
-    mut master:  M,
+    mut master: M,
     mut rx_stdin: mpsc::Receiver<StdinMsg>,
-    ob:          Option<Arc<OutputBuffer>>,
-    callbacks:   Arc<Mutex<Callbacks>>,
-    vt:          Option<Arc<StdMutex<vt100::Parser>>>,
-    mode:        CallbackMode,
+    ob: Option<Arc<OutputBuffer>>,
+    callbacks: Arc<Mutex<Callbacks>>,
+    vt: Option<Arc<StdMutex<vt100::Parser>>>,
+    mode: CallbackMode,
 ) where
     M: PtyMaster,
 {
     let mut decoder = StreamDecoder::new();
-    let mut raw     = vec![0u8; READ_CHUNK_SIZE];
+    let mut raw = vec![0u8; READ_CHUNK_SIZE];
     let mut decoded = String::new();
-    let mut carry   = String::new();
+    let mut carry = String::new();
 
     let mut ticker = tokio::time::interval(LINE_MODE_FLUSH_IDLE);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -177,10 +165,10 @@ async fn run_pty_io<M>(
 /// Raw 模式直接 emit；Line 模式先攒进 `carry` 再按行 drain。
 /// `is_stderr` 恒为 `false`：PTY 合并了 stdout/stderr。
 async fn dispatch_chunk(
-    mode:      CallbackMode,
-    decoded:   &mut String,
-    carry:     &mut String,
-    ob:        &Option<Arc<OutputBuffer>>,
+    mode: CallbackMode,
+    decoded: &mut String,
+    carry: &mut String,
+    ob: &Option<Arc<OutputBuffer>>,
     callbacks: &Arc<Mutex<Callbacks>>,
 ) {
     if decoded.is_empty() {
@@ -200,10 +188,10 @@ async fn dispatch_chunk(
 
 /// EOF/读错误时的收尾 flush。
 async fn flush_final(
-    mode:      CallbackMode,
-    decoded:   &mut String,
-    carry:     &mut String,
-    ob:        &Option<Arc<OutputBuffer>>,
+    mode: CallbackMode,
+    decoded: &mut String,
+    carry: &mut String,
+    ob: &Option<Arc<OutputBuffer>>,
     callbacks: &Arc<Mutex<Callbacks>>,
 ) {
     match mode {
@@ -227,11 +215,11 @@ async fn flush_final(
 /// 与管道模式的 join 任务保持相同的语义：只有"自然退出"才触发 `on_exit`，
 /// 被外部强制 kill 时不触发（与原管道模式行为一致）。
 async fn run_supervisor<C>(
-    mut child:     C,
-    mut drop_rx:   oneshot::Receiver<()>,
+    mut child: C,
+    mut drop_rx: oneshot::Receiver<()>,
     mut signal_rx: mpsc::Receiver<PtySignal>,
-    io_task:       JoinHandle<()>,
-    callbacks:     Arc<Mutex<Callbacks>>,
+    io_task: JoinHandle<()>,
+    callbacks: Arc<Mutex<Callbacks>>,
 ) where
     C: PtyChild,
 {

@@ -795,7 +795,7 @@ impl Shell {
         self.send(&format!("{cmd}\n")).await
     }
 
-    async fn send_eof(&mut self) -> Result<()> {
+    pub async fn send_eof(&mut self) -> Result<()> {
         self.tx_stdin
             .send(StdinMsg::Eof)
             .await
